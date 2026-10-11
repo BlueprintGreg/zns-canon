@@ -10,7 +10,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::{CryptoRng, RngCore};
+use rand::TryCryptoRng;
 use secrecy::{ExposeSecret, Secret};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -56,6 +56,9 @@ pub struct EncryptedSeedTransfer {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MigrationError {
+    #[error("operating-system randomness source failed")]
+    Rng,
+
     #[error("ephemeral public key is all zeros")]
     ZeroPublicKey,
 
@@ -85,20 +88,23 @@ pub fn migration_report_data(offer: &MigrationOffer) -> [u8; REPORT_DATA_LEN] {
 }
 
 /// Generate the M2 X25519 ephemeral keypair for one migration attempt.
-pub fn generate_ephemeral_keypair<R>(rng: &mut R) -> EphemeralKeypair
+pub fn generate_ephemeral_keypair<R>(rng: &mut R) -> Result<EphemeralKeypair, MigrationError>
 where
-    R: RngCore + CryptoRng,
+    R: TryCryptoRng,
 {
-    let secret = StaticSecret::random_from_rng(&mut *rng);
+    let mut bytes = [0u8; 32];
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|_| MigrationError::Rng)?;
+    let secret = StaticSecret::from(bytes);
     let public = PublicKey::from(&secret).to_bytes();
     let mut raw = secret.to_bytes();
     let stored = Secret::new(raw);
     raw.zeroize();
     drop(secret);
-    EphemeralKeypair {
+    Ok(EphemeralKeypair {
         secret: stored,
         public,
-    }
+    })
 }
 
 /// Encrypt the seed to M2's ephemeral public key.
@@ -111,12 +117,15 @@ pub fn encrypt_seed<R>(
     rng: &mut R,
 ) -> Result<EncryptedSeedTransfer, MigrationError>
 where
-    R: RngCore + CryptoRng,
+    R: TryCryptoRng,
 {
     if offer.ephemeral_pubkey == [0u8; 32] {
         return Err(MigrationError::ZeroPublicKey);
     }
-    let sender = StaticSecret::random_from_rng(&mut *rng);
+    let mut sender_bytes = [0u8; 32];
+    rng.try_fill_bytes(&mut sender_bytes)
+        .map_err(|_| MigrationError::Rng)?;
+    let sender = StaticSecret::from(sender_bytes);
     let sender_public = PublicKey::from(&sender).to_bytes();
     if sender_public == [0u8; 32] {
         return Err(MigrationError::ZeroPublicKey);
@@ -132,7 +141,8 @@ where
     }
 
     let mut aead_nonce = [0u8; AEAD_NONCE_LEN];
-    rng.fill_bytes(&mut aead_nonce);
+    rng.try_fill_bytes(&mut aead_nonce)
+        .map_err(|_| MigrationError::Rng)?;
     let aad = wrap_aad(
         &sender_public,
         &offer.ephemeral_pubkey,
@@ -323,7 +333,7 @@ mod tests {
     #[test]
     fn wrap_roundtrip_and_offer_binding() {
         let mut rng = rng();
-        let keypair = generate_ephemeral_keypair(&mut rng);
+        let keypair = generate_ephemeral_keypair(&mut rng).unwrap();
         let offer = MigrationOffer {
             ephemeral_pubkey: keypair.public,
             nonce: [0x44; 32],
@@ -364,7 +374,7 @@ mod tests {
             Err(MigrationError::Decrypt)
         ));
 
-        let other = generate_ephemeral_keypair(&mut rng);
+        let other = generate_ephemeral_keypair(&mut rng).unwrap();
         assert!(matches!(
             decrypt_seed(&other.secret, &offer, &transfer),
             Err(MigrationError::SecretOfferMismatch)
