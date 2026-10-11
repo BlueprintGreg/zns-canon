@@ -50,7 +50,7 @@ pub const CAPSULE_KEY_CONTEXT: &[u8] = b"ZNS_SEED/capsule/v1";
 /// Errors from capsule sealing, parsing, and unsealing.
 #[derive(Debug, Error)]
 pub enum CapsuleError {
-    #[error("operating-system randomness source failed")]
+    #[error("randomness source failed")]
     Rng,
 
     #[error("capsule magic mismatch (not a ZNS seed capsule)")]

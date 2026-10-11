@@ -56,7 +56,7 @@ pub struct EncryptedSeedTransfer {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MigrationError {
-    #[error("operating-system randomness source failed")]
+    #[error("randomness source failed")]
     Rng,
 
     #[error("ephemeral public key is all zeros")]
@@ -93,9 +93,12 @@ where
     R: TryCryptoRng,
 {
     let mut bytes = [0u8; 32];
-    rng.try_fill_bytes(&mut bytes)
-        .map_err(|_| MigrationError::Rng)?;
+    if rng.try_fill_bytes(&mut bytes).is_err() {
+        bytes.zeroize();
+        return Err(MigrationError::Rng);
+    }
     let secret = StaticSecret::from(bytes);
+    bytes.zeroize();
     let public = PublicKey::from(&secret).to_bytes();
     let mut raw = secret.to_bytes();
     let stored = Secret::new(raw);
@@ -123,9 +126,12 @@ where
         return Err(MigrationError::ZeroPublicKey);
     }
     let mut sender_bytes = [0u8; 32];
-    rng.try_fill_bytes(&mut sender_bytes)
-        .map_err(|_| MigrationError::Rng)?;
+    if rng.try_fill_bytes(&mut sender_bytes).is_err() {
+        sender_bytes.zeroize();
+        return Err(MigrationError::Rng);
+    }
     let sender = StaticSecret::from(sender_bytes);
+    sender_bytes.zeroize();
     let sender_public = PublicKey::from(&sender).to_bytes();
     if sender_public == [0u8; 32] {
         return Err(MigrationError::ZeroPublicKey);
@@ -141,8 +147,10 @@ where
     }
 
     let mut aead_nonce = [0u8; AEAD_NONCE_LEN];
-    rng.try_fill_bytes(&mut aead_nonce)
-        .map_err(|_| MigrationError::Rng)?;
+    if rng.try_fill_bytes(&mut aead_nonce).is_err() {
+        shared_bytes.zeroize();
+        return Err(MigrationError::Rng);
+    }
     let aad = wrap_aad(
         &sender_public,
         &offer.ephemeral_pubkey,

@@ -25,7 +25,7 @@ pub fn write_dev_keys(dir: impl AsRef<Path>, birthday: u32) -> std::io::Result<(
 
     let key = dev_sealing_key(CAPSULE_KEY_CONTEXT);
     let sealed = capsule::seal_seed(&key, &Secret::new(DEV_SEED), &mut rand::rngs::SysRng)
-        .expect("dev key seals the dev seed");
+        .map_err(std::io::Error::other)?;
     let blob = capsule::serialize_capsule(&sealed).expect("a fresh capsule serializes");
     std::fs::write(dir.join("zns_seed.capsule"), blob)?;
 
