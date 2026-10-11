@@ -14,7 +14,7 @@ use std::path::Path;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use rand::TryCryptoRng;
 use secrecy::{ExposeSecret, Secret};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,6 +50,9 @@ pub const CAPSULE_KEY_CONTEXT: &[u8] = b"ZNS_SEED/capsule/v1";
 /// Errors from capsule sealing, parsing, and unsealing.
 #[derive(Debug, Error)]
 pub enum CapsuleError {
+    #[error("randomness source failed")]
+    Rng,
+
     #[error("capsule magic mismatch (not a ZNS seed capsule)")]
     BadMagic,
 
@@ -155,7 +158,7 @@ pub fn seal_seed<R>(
     rng: &mut R,
 ) -> Result<Capsule, CapsuleError>
 where
-    R: RngCore,
+    R: TryCryptoRng,
 {
     let fingerprint = SeedFingerprint::from_seed(seed.expose_secret())
         .expect("ZIP-32 accepts 32-byte seeds")
@@ -165,7 +168,8 @@ where
         XChaCha20Poly1305::new_from_slice(sealing_key.expose()).expect("sealing key is 32 bytes");
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce_bytes);
+    rng.try_fill_bytes(&mut nonce_bytes)
+        .map_err(|_| CapsuleError::Rng)?;
 
     let mut aad = Vec::with_capacity(MAGIC.len() + fingerprint.len());
     aad.extend_from_slice(&MAGIC);
@@ -258,7 +262,7 @@ pub fn hash(capsule_bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
+    use rand::rngs::SysRng;
 
     #[test]
     fn hash_is_blake2b_256_of_the_exact_bytes() {
@@ -270,7 +274,7 @@ mod tests {
         // Hashing the parsed capsule and hashing the raw bytes must agree:
         // callers pass on-disk bytes, never a re-serialization.
         let key = crate::sealing::SealingKey::new([0x42; 32]);
-        let blob = serialize_capsule(&seal_seed(&key, &a_seed(), &mut OsRng).expect("seal"))
+        let blob = serialize_capsule(&seal_seed(&key, &a_seed(), &mut SysRng).expect("seal"))
             .expect("serialize");
         let parsed = parse_capsule(&blob).expect("parse");
         assert_eq!(
@@ -294,7 +298,7 @@ mod tests {
     fn seal_unseal_roundtrip() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         let out = unseal_seed(&key, &capsule).expect("unseal");
         assert_eq!(out.expose_secret(), seed.expose_secret());
     }
@@ -305,7 +309,7 @@ mod tests {
     fn bad_magic_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         capsule.magic[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -318,7 +322,7 @@ mod tests {
     fn flipped_ciphertext_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         capsule.ciphertext[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -332,7 +336,7 @@ mod tests {
     fn tampered_fingerprint_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         capsule.fingerprint[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -346,7 +350,7 @@ mod tests {
     fn bad_nonce_length_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         capsule.nonce.truncate(NONCE_LEN - 1);
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -359,7 +363,7 @@ mod tests {
     fn on_disk_serialisation_roundtrip() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         let bytes = serialize_capsule(&capsule).expect("serialize");
         let parsed = parse_capsule(&bytes).expect("parse");
         assert_eq!(parsed, capsule);
@@ -372,7 +376,7 @@ mod tests {
     fn flipped_nonce_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         capsule.nonce[0] ^= 0x01;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -386,7 +390,7 @@ mod tests {
     fn postcard_layout_matches_documented_fields() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut OsRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
         let bytes = serialize_capsule(&capsule).expect("serialize");
         assert_eq!(&bytes[0..8], b"ZNS_SEED");
         assert_eq!(&bytes[8..40], &capsule.fingerprint);
