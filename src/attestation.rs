@@ -16,9 +16,12 @@
 //!      ARK, and the VCEK signature to cover the report.
 //!      `Attestation::verify_report_data()` then checks `report_data` and
 //!      that the measurement is not zero. Both run before the attestation
-//!      report is written to disk. `verify()` and `stored()` repeat the KDS
-//!      fetch and the signature check before a report already on disk is
-//!      used, and return an error instead of panicking.
+//!      report is written to disk. `verify()` and `stored()` check the
+//!      signature again before a report already on disk is used, and return
+//!      an error instead of panicking. The VCEK and the product cert chain
+//!      are saved under `/state/kds` after they pass those checks. A later
+//!      report for the same chip and reported TCB reuses them and does not
+//!      call AMD KDS.
 
 use sev::certs::snp::ca::Chain as CaChain;
 use sev::certs::snp::{builtin, Certificate, Chain, Verifiable};
@@ -29,6 +32,7 @@ use sev::firmware::host::TcbVersion;
 use sev::parser::ByteParser;
 use sev::Generation;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use zip32::fingerprint::SeedFingerprint;
@@ -177,6 +181,9 @@ pub fn verify(
 /// Capsule attestations should use [`verify`], which derives the expected
 /// `report_data` itself. This is the general form for callers whose report
 /// layout is their own (migration hand-off flows).
+///
+/// The VCEK and the product cert chain are cached under `/state/kds` after
+/// they pass the signature checks. The report is still checked on every call.
 pub fn stored(
     report_bytes: Vec<u8>,
     expected_report_data: &[u8; REPORT_DATA_LEN],
@@ -275,6 +282,10 @@ fn chain_under_pinned_ark(ask: Certificate, vcek: Certificate) -> Result<Chain, 
 
 const KDS_ORIGIN: &str = "https://kdsintf.amd.com/vcek/v1";
 
+/// Guest state disk. Mint, keygen, and migrate all verify through `stored`
+/// and would otherwise download the same VCEK until AMD answers 429.
+const KDS_CACHE_DIR: &str = "/state/kds";
+
 /// AMD KDS product name for the CPUID family and model in an SNP report.
 ///
 /// Siena and Bergamo use the Genoa key hierarchy. Venice has no pinned ARK here.
@@ -322,19 +333,102 @@ fn cert_chain_url(product: &str) -> String {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn fetch_endorsement(report: &AttestationReport) -> Result<(Certificate, Certificate), String> {
+    fetch_endorsement_cached(report, Path::new(KDS_CACHE_DIR), https_get)
+}
+
+/// Load a cached VCEK and cert chain, or download them.
+///
+/// A hit still runs `ask_from_kds_chain` and `verify_vcek_report` against this
+/// report. Saved bytes that fail those checks are ignored and downloaded.
+/// Files are written only after the checks succeed. A missing directory or a
+/// failed write leaves a successful verification in place.
+fn fetch_endorsement_cached(
+    report: &AttestationReport,
+    cache_dir: &Path,
+    get: impl Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<(Certificate, Certificate), String> {
     vcek_signing_key(report)?;
     let product = kds_product(report)?;
+    let vcek_path = vcek_cache_path(cache_dir, product, &report.chip_id, &report.reported_tcb);
+    let chain_path = chain_cache_path(cache_dir, product);
+
+    if let (Ok(vcek_bytes), Ok(chain_bytes)) =
+        (std::fs::read(&vcek_path), std::fs::read(&chain_path))
+    {
+        match endorsement_from_bytes(report, &vcek_bytes, &chain_bytes) {
+            Ok(endorsement) => {
+                tracing::info!(product, "using cached AMD KDS certificates");
+                return Ok(endorsement);
+            }
+            Err(error) => {
+                tracing::info!(%error, "cached AMD KDS certificates were rejected");
+            }
+        }
+    }
+
     tracing::info!(product, "fetching VCEK and ASK from AMD KDS");
+    let vcek_bytes = get(&vcek_url(product, &report.chip_id, &report.reported_tcb))?;
+    let chain_bytes = get(&cert_chain_url(product))?;
+    let endorsement = endorsement_from_bytes(report, &vcek_bytes, &chain_bytes)?;
+    write_kds_cache(&vcek_path, &vcek_bytes, &chain_path, &chain_bytes);
+    Ok(endorsement)
+}
 
-    let vcek_bytes = https_get(&vcek_url(product, &report.chip_id, &report.reported_tcb))?;
-    let vcek = Certificate::from_der(&vcek_bytes)
-        .or_else(|_| Certificate::from_pem(&vcek_bytes))
+fn endorsement_from_bytes(
+    report: &AttestationReport,
+    vcek_bytes: &[u8],
+    chain_bytes: &[u8],
+) -> Result<(Certificate, Certificate), String> {
+    let vcek = Certificate::from_der(vcek_bytes)
+        .or_else(|_| Certificate::from_pem(vcek_bytes))
         .map_err(|error| format!("AMD KDS VCEK: {error}"))?;
-
-    let chain_bytes = https_get(&cert_chain_url(product))?;
-    let chain_certs = pem_certificates(&chain_bytes)?;
+    let chain_certs = pem_certificates(chain_bytes)?;
     let ask = ask_from_kds_chain(&chain_certs, &vcek)?;
+    verify_vcek_report(report, &ask, &vcek)?;
     Ok((ask, vcek))
+}
+
+/// VCEK file name: product, chip id, and the reported TCB fields in `vcek_url`.
+fn vcek_cache_path(
+    cache_dir: &Path,
+    product: &str,
+    chip_id: &[u8; 64],
+    tcb: &TcbVersion,
+) -> PathBuf {
+    let mut name = format!(
+        "{product}-{}-bl{}-tee{}-snp{}-ucode{}",
+        hex::encode(chip_id),
+        tcb.bootloader,
+        tcb.tee,
+        tcb.snp,
+        tcb.microcode
+    );
+    if let Some(fmc) = tcb.fmc {
+        name.push_str(&format!("-fmc{fmc}"));
+    }
+    name.push_str(".vcek");
+    cache_dir.join(name)
+}
+
+fn chain_cache_path(cache_dir: &Path, product: &str) -> PathBuf {
+    cache_dir.join(format!("{product}-cert_chain.pem"))
+}
+
+/// Create `/state/kds` if needed. A failure here does not undo a verification
+/// that already holds good certificates.
+fn write_kds_cache(vcek_path: &Path, vcek_bytes: &[u8], chain_path: &Path, chain_bytes: &[u8]) {
+    if let Some(cache_dir) = vcek_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(cache_dir) {
+            tracing::warn!(%error, "AMD KDS cache directory was not created");
+            return;
+        }
+    }
+    if let Err(error) = std::fs::write(vcek_path, vcek_bytes) {
+        tracing::warn!(%error, "AMD KDS VCEK was not cached");
+    }
+    if let Err(error) = std::fs::write(chain_path, chain_bytes) {
+        tracing::warn!(%error, "AMD KDS cert chain was not cached");
+    }
 }
 
 /// The cert-chain bundle holds the ASK and the KDS ARK. Return the ASK that
@@ -552,5 +646,150 @@ mod tests {
             ..tcb
         };
         assert!(vcek_url("Turin", &chip_id, &turin).ends_with("&fmcSPL=7"));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Version 2 reports omit CPUID. Product selection still needs a family
+    /// and model, and those fields are not part of the signed encoding.
+    fn milan_report_for_kds() -> AttestationReport {
+        let mut report = milan_report();
+        report.cpuid_fam_id = Some(0x19);
+        report.cpuid_mod_id = Some(0x01);
+        report
+    }
+
+    fn milan_kds_chain() -> Vec<u8> {
+        let ark = builtin::milan::ark().unwrap();
+        let ask = builtin::milan::ask().unwrap();
+        [ark.to_pem().unwrap(), ask.to_pem().unwrap()].concat()
+    }
+
+    struct KdsProbe {
+        calls: AtomicUsize,
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl KdsProbe {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                urls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn get(&self, url: &str) -> Result<Vec<u8>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().unwrap().push(url.to_string());
+            if url.contains("/cert_chain") {
+                Ok(milan_kds_chain())
+            } else {
+                Ok(MILAN_VCEK_DER.to_vec())
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn temp_kds_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zns-canon-kds-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_second_report_with_the_same_chip_and_tcb_does_not_call_kds() {
+        let dir = temp_kds_dir("reuse");
+        let probe = KdsProbe::new();
+        let report = milan_report_for_kds();
+        fetch_endorsement_cached(&report, &dir, |url| probe.get(url)).unwrap();
+        assert_eq!(probe.calls(), 2);
+
+        let mut other = report;
+        other.cpuid_step = Some(9);
+        assert_eq!(other.chip_id, report.chip_id);
+        assert_eq!(other.reported_tcb, report.reported_tcb);
+        fetch_endorsement_cached(&other, &dir, |url| probe.get(url)).unwrap();
+        assert_eq!(probe.calls(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_different_spl_or_chip_id_calls_kds() {
+        let dir = temp_kds_dir("miss");
+        let probe = KdsProbe::new();
+        let report = milan_report_for_kds();
+        fetch_endorsement_cached(&report, &dir, |url| probe.get(url)).unwrap();
+        let after_first = probe.calls();
+
+        let mut other_spl = report;
+        other_spl.reported_tcb.snp = other_spl.reported_tcb.snp.wrapping_add(1);
+        let spl_error = fetch_endorsement_cached(&other_spl, &dir, |url| probe.get(url));
+        assert!(spl_error.is_err(), "a mutated TCB is a different VCEK");
+        assert!(probe.calls() > after_first);
+        let spl = format!("snpSPL={}", other_spl.reported_tcb.snp);
+        assert!(probe
+            .urls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url.contains(&spl)));
+
+        let after_spl = probe.calls();
+        let mut other_chip = report;
+        other_chip.chip_id[0] ^= 0xff;
+        let chip_error = fetch_endorsement_cached(&other_chip, &dir, |url| probe.get(url));
+        assert!(chip_error.is_err(), "a mutated chip id is a different VCEK");
+        assert!(probe.calls() > after_spl);
+        let chip = hex::encode(other_chip.chip_id);
+        assert!(probe
+            .urls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|url| url.contains(&chip)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cached_chain_that_fails_the_pinned_ark_is_fetched() {
+        let dir = temp_kds_dir("bad-ark");
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = milan_report_for_kds();
+        let chain_path = chain_cache_path(&dir, "Milan");
+        let vcek_path = vcek_cache_path(&dir, "Milan", &report.chip_id, &report.reported_tcb);
+        std::fs::write(
+            &chain_path,
+            builtin::turin::ask().unwrap().to_pem().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&vcek_path, MILAN_VCEK_DER).unwrap();
+
+        let probe = KdsProbe::new();
+        fetch_endorsement_cached(&report, &dir, |url| probe.get(url)).unwrap();
+        assert_eq!(probe.calls(), 2);
+        assert_eq!(std::fs::read(&chain_path).unwrap(), milan_kds_chain());
+
+        fetch_endorsement_cached(&report, &dir, |url| probe.get(url)).unwrap();
+        assert_eq!(probe.calls(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_cache_write_still_returns_the_certificates() {
+        let dir = temp_kds_dir("write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let probe = KdsProbe::new();
+        fetch_endorsement_cached(&milan_report_for_kds(), &blocker.join("kds"), |url| {
+            probe.get(url)
+        })
+        .unwrap();
+        assert_eq!(probe.calls(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
