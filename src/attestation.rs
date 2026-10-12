@@ -31,7 +31,7 @@ use sev::firmware::guest::Firmware;
 use sev::firmware::host::TcbVersion;
 use sev::parser::ByteParser;
 use sev::Generation;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -416,6 +416,10 @@ fn chain_cache_path(cache_dir: &Path, product: &str) -> PathBuf {
 
 /// Create `/state/kds` if needed. A failure here does not undo a verification
 /// that already holds good certificates.
+///
+/// Each file is written to a temporary name in the same directory, flushed,
+/// and renamed over the destination. A crash or a concurrent reader never
+/// sees a truncated VCEK or cert chain.
 fn write_kds_cache(vcek_path: &Path, vcek_bytes: &[u8], chain_path: &Path, chain_bytes: &[u8]) {
     if let Some(cache_dir) = vcek_path.parent() {
         if let Err(error) = std::fs::create_dir_all(cache_dir) {
@@ -423,12 +427,46 @@ fn write_kds_cache(vcek_path: &Path, vcek_bytes: &[u8], chain_path: &Path, chain
             return;
         }
     }
-    if let Err(error) = std::fs::write(vcek_path, vcek_bytes) {
+    if let Err(error) = replace_cache_file(vcek_path, vcek_bytes) {
         tracing::warn!(%error, "AMD KDS VCEK was not cached");
     }
-    if let Err(error) = std::fs::write(chain_path, chain_bytes) {
+    if let Err(error) = replace_cache_file(chain_path, chain_bytes) {
         tracing::warn!(%error, "AMD KDS cert chain was not cached");
     }
+}
+
+fn replace_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = cache_temp_path(path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AMD KDS cache path has no file name",
+        )
+    })?;
+    if let Err(error) = write_cache_temp(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_cache_temp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn cache_temp_path(dest: &Path) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = dest.parent()?;
+    let name = dest.file_name()?.to_string_lossy();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    Some(dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id())))
 }
 
 /// The cert-chain bundle holds the ASK and the KDS ARK. Return the ASK that
@@ -790,6 +828,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(probe.calls(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_replace_does_not_leave_a_temporary_file() {
+        let dir = temp_kds_dir("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Milan-cert_chain.pem");
+        std::fs::write(&path, b"old-chain").unwrap();
+        replace_cache_file(&path, b"new-chain").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-chain");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("Milan-cert_chain.pem")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_the_cached_chain_intact() {
+        let dir = temp_kds_dir("atomic-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Milan-cert_chain.pem");
+        std::fs::write(&path, b"old-chain").unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let error = replace_cache_file(&path, b"new-chain").unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old-chain", "{error}");
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&dir, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
