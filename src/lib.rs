@@ -14,6 +14,7 @@ compile_error!(
     "the non-tee feature is a development escape hatch (public sealing keys, no attestation) and must not be enabled in release/production builds"
 );
 
+pub mod access_code;
 pub mod attestation;
 pub mod capsule;
 pub mod genesis;
