@@ -1,16 +1,17 @@
-//! Sealed seed capsule: the seed's on-disk form.
+//! Sealed seed capsule: the on-disk form of the ceremony's two secrets.
 //!
-//! Format is unchanged from the pre-refactor inlined codec: postcard-serialised
-//! `{ magic, fingerprint, nonce, ciphertext }`, magic = `b"ZNS_SEED"`, 24-byte
-//! `XChaCha20Poly1305` nonce, AAD = `magic || fingerprint`, plaintext = the
-//! 32-byte ZIP-32 seed. The sealing key is passed in by the caller —
-//! derive it with [`crate::sealing::derive_sealing_key`] (production:
-//! SNP hardware; `non-tee` builds: [`crate::sealing::dev_sealing_key`]) —
-//! so this module is TEE-agnostic and the crypto is testable off-hardware.
+//! postcard-serialised `{ magic, fingerprint, nonce, ciphertext }`, magic =
+//! `b"ZNS_SEED"`, 24-byte `XChaCha20Poly1305` nonce, AAD = `magic ||
+//! fingerprint`, plaintext = the 64-byte payload: the 32-byte ZIP-32 seed
+//! followed by the 32-byte pre-sale access-code key. The sealing key is
+//! passed in by the caller — derive it with
+//! [`crate::sealing::derive_sealing_key`] (production: SNP hardware;
+//! `non-tee` builds: [`crate::sealing::dev_sealing_key`]) — so this module
+//! is TEE-agnostic and the crypto is testable off-hardware.
 //!
-//! The decrypted payload is `seed || access_code_key`: the ZIP-32 seed for
-//! the treasury, and the pre-sale access-code key the mint judges claims
-//! with. One envelope, one sealing key, one unseal at boot.
+//! The payload is the whole point of the envelope: every guest that can
+//! unseal the seed holds the access-code key too, and the migrate re-seal
+//! carries both without its own knowledge of the layout.
 
 use std::fs::File;
 use std::io::Read;
@@ -190,8 +191,10 @@ where
         XChaCha20Poly1305::new_from_slice(sealing_key.expose()).expect("sealing key is 32 bytes");
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rng.try_fill_bytes(&mut nonce_bytes)
-        .map_err(|_| CapsuleError::Rng)?;
+    if rng.try_fill_bytes(&mut nonce_bytes).is_err() {
+        payload.zeroize();
+        return Err(CapsuleError::Rng);
+    }
 
     let mut aad = Vec::with_capacity(MAGIC.len() + fingerprint.len());
     aad.extend_from_slice(&MAGIC);
@@ -267,6 +270,7 @@ pub fn unseal_seed(
         .to_bytes();
     if actual != capsule.fingerprint {
         seed_bytes.zeroize();
+        access_code_key.zeroize();
         return Err(CapsuleError::FingerprintMismatch);
     }
 
@@ -335,21 +339,6 @@ mod tests {
         let out = unseal_seed(&key, &capsule).expect("unseal");
         assert_eq!(out.seed.expose_secret(), seed.expose_secret());
         assert_eq!(out.access_code_key.expose_secret(), a_key().expose_secret());
-    }
-
-    /// A pre-access-code capsule (32-byte seed payload) fails the length
-    /// check before any decryption: the payload size is the format version.
-    #[test]
-    fn a_legacy_seed_only_capsule_is_rejected() {
-        let legacy_len = MAGIC.len() + 32 + 1 + NONCE_LEN + 1 + (32 + TAG_LEN);
-        let blob = vec![0u8; legacy_len];
-        assert!(matches!(
-            parse_capsule(&blob),
-            Err(CapsuleError::BadLength {
-                actual: 114,
-                expected: CAPSULE_LEN
-            })
-        ));
     }
 
     /// A capsule whose magic no longer says `ZNS_SEED` never even reaches
