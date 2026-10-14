@@ -54,6 +54,20 @@ pub struct EncryptedSeedTransfer {
     pub ciphertext: [u8; TRANSFER_CIPHERTEXT_LEN],
 }
 
+/// Ciphertext of a bare 32-byte secret wrapped to one recipient.
+pub const WRAPPED_SECRET_CIPHERTEXT_LEN: usize = 32 + TAG_LEN;
+
+/// A bare 32-byte secret wrapped to one recipient — the same construction
+/// as [`EncryptedSeedTransfer`], 104 bytes on disk instead of 136. The
+/// access-code key export uses this: the operator's copy must carry only
+/// the access-code key, never the seed half of the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrappedSecret {
+    pub sender_ephemeral_pubkey: [u8; 32],
+    pub nonce: [u8; AEAD_NONCE_LEN],
+    pub ciphertext: [u8; WRAPPED_SECRET_CIPHERTEXT_LEN],
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MigrationError {
     #[error("randomness source failed")]
@@ -123,6 +137,52 @@ pub fn encrypt_seed<R>(
 where
     R: TryCryptoRng,
 {
+    let mut payload_bytes = [0u8; PAYLOAD_LEN];
+    payload_bytes[..SEED_LEN].copy_from_slice(payload.seed.expose_secret());
+    payload_bytes[SEED_LEN..].copy_from_slice(payload.access_code_key.expose_secret());
+    let (sender_public, nonce, ciphertext) = seal_to_offer(&payload_bytes, offer, rng)?;
+    payload_bytes.zeroize();
+    let mut out = [0u8; TRANSFER_CIPHERTEXT_LEN];
+    out.copy_from_slice(&ciphertext);
+    Ok(EncryptedSeedTransfer {
+        sender_ephemeral_pubkey: sender_public,
+        nonce,
+        ciphertext: out,
+    })
+}
+
+/// Wrap a bare 32-byte secret to `offer.ephemeral_pubkey`: the same
+/// construction as [`encrypt_seed`], 104 bytes on disk instead of 136.
+pub fn wrap_secret<R>(
+    secret: &Secret<[u8; 32]>,
+    offer: &MigrationOffer,
+    rng: &mut R,
+) -> Result<WrappedSecret, MigrationError>
+where
+    R: TryCryptoRng,
+{
+    let (sender_public, nonce, ciphertext) = seal_to_offer(secret.expose_secret(), offer, rng)?;
+    let mut out = [0u8; WRAPPED_SECRET_CIPHERTEXT_LEN];
+    out.copy_from_slice(&ciphertext);
+    Ok(WrappedSecret {
+        sender_ephemeral_pubkey: sender_public,
+        nonce,
+        ciphertext: out,
+    })
+}
+
+/// The shared wrap: DH to `offer.ephemeral_pubkey`, the offer fields mixed
+/// into the wrap key and the AEAD associated data, XChaCha20Poly1305 over
+/// the plaintext. Returns the one-time sender public key, the AEAD nonce,
+/// and the ciphertext.
+fn seal_to_offer<R>(
+    plaintext: &[u8],
+    offer: &MigrationOffer,
+    rng: &mut R,
+) -> Result<([u8; 32], [u8; AEAD_NONCE_LEN], Vec<u8>), MigrationError>
+where
+    R: TryCryptoRng,
+{
     if offer.ephemeral_pubkey == [0u8; 32] {
         return Err(MigrationError::ZeroPublicKey);
     }
@@ -168,30 +228,17 @@ where
         );
         shared_bytes.zeroize();
         let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("wrap key is 32 bytes");
-        let mut payload_bytes = [0u8; PAYLOAD_LEN];
-        payload_bytes[..SEED_LEN].copy_from_slice(payload.seed.expose_secret());
-        payload_bytes[SEED_LEN..].copy_from_slice(payload.access_code_key.expose_secret());
         let result = cipher.encrypt(
             XNonce::from_slice(&aead_nonce),
             Payload {
-                msg: &payload_bytes,
+                msg: plaintext,
                 aad: &aad,
             },
         );
-        payload_bytes.zeroize();
         key.zeroize();
         result.map_err(|_| MigrationError::Seal)?
     };
-    if ciphertext.len() != TRANSFER_CIPHERTEXT_LEN {
-        return Err(MigrationError::Seal);
-    }
-    let mut out = [0u8; TRANSFER_CIPHERTEXT_LEN];
-    out.copy_from_slice(&ciphertext);
-    Ok(EncryptedSeedTransfer {
-        sender_ephemeral_pubkey: sender_public,
-        nonce: aead_nonce,
-        ciphertext: out,
-    })
+    Ok((sender_public, aead_nonce, ciphertext))
 }
 
 /// Decrypt a seed ciphertext with M2's ephemeral secret key.
@@ -203,54 +250,14 @@ pub fn decrypt_seed(
     offer: &MigrationOffer,
     transfer: &EncryptedSeedTransfer,
 ) -> Result<SeedAndAccessCodeKey, MigrationError> {
-    if offer.ephemeral_pubkey == [0u8; 32] || transfer.sender_ephemeral_pubkey == [0u8; 32] {
-        return Err(MigrationError::ZeroPublicKey);
-    }
-    let secret = StaticSecret::from(*ephemeral_secret.expose_secret());
-    let derived_public = PublicKey::from(&secret).to_bytes();
-    if !ct_eq(&derived_public, &offer.ephemeral_pubkey) {
-        return Err(MigrationError::SecretOfferMismatch);
-    }
-    let sender_public = PublicKey::from(transfer.sender_ephemeral_pubkey);
-    let shared = secret.diffie_hellman(&sender_public);
-    let mut shared_bytes = *shared.as_bytes();
-    drop(shared);
-    drop(secret);
-    if shared_bytes == [0u8; 32] {
-        shared_bytes.zeroize();
-        return Err(MigrationError::NonContributory);
-    }
-
-    let aad = wrap_aad(
+    let mut plaintext = open_from_offer(
+        ephemeral_secret,
+        offer,
         &transfer.sender_ephemeral_pubkey,
-        &offer.ephemeral_pubkey,
-        &offer.nonce,
-        &offer.manifest_hash,
-    );
-    let mut plaintext = {
-        let mut key = wrap_key(
-            &shared_bytes,
-            &transfer.sender_ephemeral_pubkey,
-            &offer.ephemeral_pubkey,
-            &offer.nonce,
-            &offer.manifest_hash,
-        );
-        shared_bytes.zeroize();
-        let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("wrap key is 32 bytes");
-        let result = cipher.decrypt(
-            XNonce::from_slice(&transfer.nonce),
-            Payload {
-                msg: &transfer.ciphertext,
-                aad: &aad,
-            },
-        );
-        key.zeroize();
-        result.map_err(|_| MigrationError::Decrypt)?
-    };
-    if plaintext.len() != PAYLOAD_LEN {
-        plaintext.zeroize();
-        return Err(MigrationError::Decrypt);
-    }
+        &transfer.nonce,
+        &transfer.ciphertext,
+        PAYLOAD_LEN,
+    )?;
     let mut seed = [0u8; SEED_LEN];
     seed.copy_from_slice(&plaintext[..SEED_LEN]);
     let mut access_code_key = [0u8; ACCESS_CODE_KEY_LEN];
@@ -263,6 +270,90 @@ pub fn decrypt_seed(
     seed.zeroize();
     access_code_key.zeroize();
     Ok(opened)
+}
+
+/// Open a bare 32-byte secret wrapped by [`wrap_secret`]. The secret must
+/// be the private key for `offer.ephemeral_pubkey`, and the offer fields
+/// must be the ones mixed into the wrap.
+pub fn unwrap_secret(
+    ephemeral_secret: &Secret<[u8; 32]>,
+    offer: &MigrationOffer,
+    wrapped: &WrappedSecret,
+) -> Result<Secret<[u8; 32]>, MigrationError> {
+    let mut plaintext = open_from_offer(
+        ephemeral_secret,
+        offer,
+        &wrapped.sender_ephemeral_pubkey,
+        &wrapped.nonce,
+        &wrapped.ciphertext,
+        32,
+    )?;
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    Ok(Secret::new(key))
+}
+
+/// The shared open: the secret must be the private key for
+/// `offer.ephemeral_pubkey`, and the offer fields must be the ones mixed
+/// into the wrap key and AEAD.
+fn open_from_offer(
+    ephemeral_secret: &Secret<[u8; 32]>,
+    offer: &MigrationOffer,
+    sender_ephemeral_pubkey: &[u8; 32],
+    aead_nonce: &[u8; AEAD_NONCE_LEN],
+    ciphertext: &[u8],
+    plaintext_len: usize,
+) -> Result<Vec<u8>, MigrationError> {
+    if offer.ephemeral_pubkey == [0u8; 32] || sender_ephemeral_pubkey == &[0u8; 32] {
+        return Err(MigrationError::ZeroPublicKey);
+    }
+    let secret = StaticSecret::from(*ephemeral_secret.expose_secret());
+    let derived_public = PublicKey::from(&secret).to_bytes();
+    if !ct_eq(&derived_public, &offer.ephemeral_pubkey) {
+        return Err(MigrationError::SecretOfferMismatch);
+    }
+    let sender_public = PublicKey::from(*sender_ephemeral_pubkey);
+    let shared = secret.diffie_hellman(&sender_public);
+    let mut shared_bytes = *shared.as_bytes();
+    drop(shared);
+    drop(secret);
+    if shared_bytes == [0u8; 32] {
+        shared_bytes.zeroize();
+        return Err(MigrationError::NonContributory);
+    }
+
+    let aad = wrap_aad(
+        sender_ephemeral_pubkey,
+        &offer.ephemeral_pubkey,
+        &offer.nonce,
+        &offer.manifest_hash,
+    );
+    let mut plaintext = {
+        let mut key = wrap_key(
+            &shared_bytes,
+            sender_ephemeral_pubkey,
+            &offer.ephemeral_pubkey,
+            &offer.nonce,
+            &offer.manifest_hash,
+        );
+        shared_bytes.zeroize();
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("wrap key is 32 bytes");
+        let result = cipher.decrypt(
+            XNonce::from_slice(aead_nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        );
+        key.zeroize();
+        result.map_err(|_| MigrationError::Decrypt)?
+    };
+    if plaintext.len() != plaintext_len {
+        plaintext.zeroize();
+        return Err(MigrationError::Decrypt);
+    }
+    Ok(plaintext)
 }
 
 fn wrap_key(
