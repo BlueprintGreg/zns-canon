@@ -2894,6 +2894,7 @@ dependencies = [
  "blake2b_simd",
  "chacha20poly1305",
  "hex",
+ "hmac",
  "postcard",
  "rand 0.10.3",
  "secrecy",

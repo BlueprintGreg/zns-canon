@@ -13,6 +13,7 @@ non-tee = []
 blake2b_simd = "1"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 hex = "0.4"
+hmac = "0.12"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand = "0.10"
 secrecy = "0.8"
