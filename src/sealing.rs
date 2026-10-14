@@ -165,11 +165,83 @@ pub fn get_attestation(report_data: &[u8; 64]) -> Result<Attestation, TeeError> 
     Ok(Attestation::new(bytes, *report_data))
 }
 
+/// Derives the sealing key at a fixed TCB version: the fields of
+/// [`derive_sealing_key`] plus `TCB_VERSION` (GUEST_FIELD_SELECT bit 5).
+///
+/// [`derive_sealing_key`] leaves that bit clear, so the firmware derives
+/// from the VCEK of the platform TCB. A committed firmware or microcode
+/// update raises that TCB, the key changes, and the capsule no longer opens
+/// on the same chip. The VCEK of any TCB at or below `LaunchTcb` stays
+/// derivable (SNP ABI 56860 §2.3, §7.2), so a key pinned to the TCB recorded
+/// when the capsule was sealed survives later updates. Any firmware at or
+/// above that TCB can derive it.
+///
+/// `tcb` is the raw 8-byte TCB_VERSION as [`launch_tcb`] returns it. Zero is
+/// refused.
+#[cfg(target_os = "linux")]
+pub fn derive_sealing_key_at_tcb(tcb: u64) -> Result<SealingKey, TeeError> {
+    use sev::firmware::guest::{DerivedKey, Firmware, GuestFieldSelect};
+
+    require_tcb(tcb)?;
+    let mut firmware =
+        Firmware::open().map_err(|e| guest_open_error(e, "firmware open", TeeError::SealingKey))?;
+    let mut guest_fields = GuestFieldSelect::default();
+    guest_fields.set_guest_policy(true);
+    guest_fields.set_measurement(true);
+    guest_fields.set_tcb_version(true);
+    let request = DerivedKey::new(false, guest_fields, 0, 0, tcb, None);
+    firmware
+        .get_derived_key(Some(1), request)
+        .map(SealingKey::new)
+        .map_err(|e| TeeError::SealingKey(format!("SEV-SNP get_derived_key: {e}")))
+}
+
+/// The TCB this guest was launched under: `LAUNCH_TCB` from a fresh report.
+/// This is the value to pin with [`derive_sealing_key_at_tcb`] when sealing.
+#[cfg(target_os = "linux")]
+pub fn launch_tcb() -> Result<u64, TeeError> {
+    let report = get_attestation(&[0u8; 64])?;
+    launch_tcb_from_report(report.as_bytes())
+}
+
+/// Offset of `LAUNCH_TCB` in an SNP attestation report (ABI 56860, Table 23).
+const LAUNCH_TCB_OFFSET: usize = 0x1F0;
+
+/// `LAUNCH_TCB` from raw report bytes, as the 8-byte little-endian
+/// TCB_VERSION the firmware encodes. Zero is refused: firmware that predates
+/// the field leaves it reserved, and a key pinned to TCB 0 is derivable by
+/// any firmware.
+pub fn launch_tcb_from_report(report: &[u8]) -> Result<u64, TeeError> {
+    let raw = report
+        .get(LAUNCH_TCB_OFFSET..LAUNCH_TCB_OFFSET + 8)
+        .ok_or_else(|| TeeError::SealingKey("attestation report has no LAUNCH_TCB".into()))?;
+    let tcb = u64::from_le_bytes(raw.try_into().expect("8-byte slice"));
+    require_tcb(tcb)?;
+    Ok(tcb)
+}
+
+fn require_tcb(tcb: u64) -> Result<(), TeeError> {
+    if tcb == 0 {
+        return Err(TeeError::SealingKey("TCB version is zero".into()));
+    }
+    Ok(())
+}
+
 /// Non-SNP platforms compile the same functions; they fail with
 /// [`TeeError::Unavailable`] at runtime. Development uses
 /// [`dev_sealing_key`] and simply has no attestation.
 #[cfg(not(target_os = "linux"))]
 pub fn derive_sealing_key(_context: &[u8]) -> Result<SealingKey, TeeError> {
+    Err(TeeError::Unavailable)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn derive_sealing_key_at_tcb(_tcb: u64) -> Result<SealingKey, TeeError> {
+    Err(TeeError::Unavailable)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn launch_tcb() -> Result<u64, TeeError> {
     Err(TeeError::Unavailable)
 }
 
@@ -181,6 +253,39 @@ pub fn get_attestation(_report_data: &[u8; 64]) -> Result<Attestation, TeeError>
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod launch_tcb_tests {
+    use super::*;
+
+    const MILAN_REPORT_HEX: &[u8] = include_bytes!("testdata/report_milan.hex");
+
+    fn milan_report() -> Vec<u8> {
+        hex::decode(MILAN_REPORT_HEX).expect("fixture hex")
+    }
+
+    /// The Milan fixture launched at bootloader 3, TEE 0, SNP 8, microcode 0x73.
+    #[test]
+    fn launch_tcb_is_read_raw_from_the_report() {
+        assert_eq!(
+            launch_tcb_from_report(&milan_report()).expect("LAUNCH_TCB"),
+            0x7308_0000_0000_0003
+        );
+    }
+
+    #[test]
+    fn a_short_report_has_no_launch_tcb() {
+        let report = milan_report();
+        assert!(launch_tcb_from_report(&report[..LAUNCH_TCB_OFFSET + 7]).is_err());
+    }
+
+    #[test]
+    fn a_zero_launch_tcb_is_refused() {
+        let mut report = milan_report();
+        report[LAUNCH_TCB_OFFSET..LAUNCH_TCB_OFFSET + 8].fill(0);
+        assert!(launch_tcb_from_report(&report).is_err());
+    }
+}
 
 #[cfg(all(test, feature = "non-tee"))]
 mod tests {
