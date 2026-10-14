@@ -277,7 +277,7 @@ pub fn verify_vcek_report(
 /// Refuse a debug launch and firmware below the pinned SNP TCB.
 ///
 /// Called from [`request`] and [`stored`] after the report parses and before
-/// AMD is contacted. The signature check still runs on every report.
+/// AMD is contacted. Signature verification follows when these admission checks succeed.
 pub fn require_launch(report: &AttestationReport) -> Result<(), AttestationError> {
     let policy = u64::from(report.policy);
     if policy != LAUNCH_POLICY {
