@@ -7,6 +7,10 @@
 //! derive it with [`crate::sealing::derive_sealing_key`] (production:
 //! SNP hardware; `non-tee` builds: [`crate::sealing::dev_sealing_key`]) —
 //! so this module is TEE-agnostic and the crypto is testable off-hardware.
+//!
+//! The decrypted payload is `seed || access_code_key`: the ZIP-32 seed for
+//! the treasury, and the pre-sale access-code key the mint judges claims
+//! with. One envelope, one sealing key, one unseal at boot.
 
 use std::fs::File;
 use std::io::Read;
@@ -32,11 +36,17 @@ pub const NONCE_LEN: usize = 24;
 /// The ZIP-32 seed length in bytes.
 pub const SEED_LEN: usize = 32;
 
-/// Poly1305 tag appended to the seed.
+/// Poly1305 tag appended to the payload.
 const TAG_LEN: usize = 16;
 
-/// Ciphertext is the seed plus its tag.
-pub const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
+/// The access-code key rides inside the capsule beside the seed.
+pub const ACCESS_CODE_KEY_LEN: usize = 32;
+
+/// The decrypted capsule payload: `seed || access_code_key`.
+pub const PAYLOAD_LEN: usize = SEED_LEN + ACCESS_CODE_KEY_LEN;
+
+/// Ciphertext is the payload plus its tag.
+pub const CIPHERTEXT_LEN: usize = PAYLOAD_LEN + TAG_LEN;
 
 /// On-disk size: magic, fingerprint, nonce, ciphertext, and the two
 /// postcard length bytes. A longer file is not a capsule.
@@ -77,7 +87,7 @@ pub enum CapsuleError {
     #[error("capsule sealing failed")]
     Seal,
 
-    #[error("decrypted seed is not exactly {SEED_LEN} bytes")]
+    #[error("decrypted payload is not exactly {PAYLOAD_LEN} bytes")]
     BadSeedSize,
 
     #[error("capsule fingerprint does not match the seed it holds")]
@@ -91,6 +101,13 @@ pub struct Capsule {
     pub fingerprint: [u8; 32],
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
+}
+
+/// The decrypted capsule contents. The seed drives the treasury; the
+/// access-code key drives pre-sale claim judging.
+pub struct SeedAndAccessCodeKey {
+    pub seed: Secret<[u8; SEED_LEN]>,
+    pub access_code_key: Secret<[u8; ACCESS_CODE_KEY_LEN]>,
 }
 
 /// Reads at most one byte past [`CAPSULE_LEN`]. A different length is
@@ -146,7 +163,8 @@ pub fn serialize_capsule(capsule: &Capsule) -> Result<Vec<u8>, CapsuleError> {
     postcard::to_allocvec(capsule).map_err(|e| CapsuleError::Parse(e.to_string()))
 }
 
-/// Seals a 32-byte seed into a capsule under `sealing_key`.
+/// Seals the seed and the access-code key into a capsule under
+/// `sealing_key`.
 ///
 /// The capsule's fingerprint field is computed from the seed itself (so
 /// `unseal_seed` can re-derive and cross-check) and is bound into the AEAD
@@ -155,11 +173,15 @@ pub fn serialize_capsule(capsule: &Capsule) -> Result<Vec<u8>, CapsuleError> {
 pub fn seal_seed<R>(
     sealing_key: &SealingKey,
     seed: &Secret<[u8; SEED_LEN]>,
+    access_code_key: &Secret<[u8; ACCESS_CODE_KEY_LEN]>,
     rng: &mut R,
 ) -> Result<Capsule, CapsuleError>
 where
     R: TryCryptoRng,
 {
+    let mut payload = [0u8; PAYLOAD_LEN];
+    payload[..SEED_LEN].copy_from_slice(seed.expose_secret());
+    payload[SEED_LEN..].copy_from_slice(access_code_key.expose_secret());
     let fingerprint = SeedFingerprint::from_seed(seed.expose_secret())
         .expect("ZIP-32 accepts 32-byte seeds")
         .to_bytes();
@@ -179,11 +201,12 @@ where
         .encrypt(
             XNonce::from_slice(&nonce_bytes),
             Payload {
-                msg: seed.expose_secret(),
+                msg: &payload,
                 aad: &aad,
             },
         )
         .map_err(|_| CapsuleError::Seal);
+    payload.zeroize();
     let ciphertext = ciphertext?;
 
     Ok(Capsule {
@@ -197,13 +220,13 @@ where
 /// Unseals a capsule under `sealing_key` (the same key `seal_seed` used).
 ///
 /// Verifies (in order): the magic, the nonce and ciphertext lengths,
-/// the AEAD tag with AAD = `magic || fingerprint`, the decrypted seed
-/// length, and the fingerprint the seed derives to. The returned
-/// [`Secret`] wipes on drop.
+/// the AEAD tag with AAD = `magic || fingerprint`, the decrypted payload
+/// length, and the fingerprint the seed derives to. Both returned
+/// [`Secret`]s wipe on drop.
 pub fn unseal_seed(
     sealing_key: &SealingKey,
     capsule: &Capsule,
-) -> Result<Secret<[u8; SEED_LEN]>, CapsuleError> {
+) -> Result<SeedAndAccessCodeKey, CapsuleError> {
     if capsule.magic != MAGIC {
         return Err(CapsuleError::BadMagic);
     }
@@ -225,12 +248,14 @@ pub fn unseal_seed(
     );
     let mut plaintext = plaintext.map_err(|_| CapsuleError::Decrypt)?;
 
-    if plaintext.len() != SEED_LEN {
+    if plaintext.len() != PAYLOAD_LEN {
         plaintext.zeroize();
         return Err(CapsuleError::BadSeedSize);
     }
     let mut seed_bytes = [0u8; SEED_LEN];
-    seed_bytes.copy_from_slice(&plaintext);
+    seed_bytes.copy_from_slice(&plaintext[..SEED_LEN]);
+    let mut access_code_key = [0u8; ACCESS_CODE_KEY_LEN];
+    access_code_key.copy_from_slice(&plaintext[SEED_LEN..]);
     plaintext.zeroize();
 
     // Cross-check: the capsule's declared fingerprint must match what the
@@ -245,7 +270,10 @@ pub fn unseal_seed(
         return Err(CapsuleError::FingerprintMismatch);
     }
 
-    Ok(Secret::new(seed_bytes))
+    Ok(SeedAndAccessCodeKey {
+        seed: Secret::new(seed_bytes),
+        access_code_key: Secret::new(access_code_key),
+    })
 }
 
 /// The capsule hash: BLAKE2b-256 of the capsule's on-disk bytes — the
@@ -274,8 +302,9 @@ mod tests {
         // Hashing the parsed capsule and hashing the raw bytes must agree:
         // callers pass on-disk bytes, never a re-serialization.
         let key = crate::sealing::SealingKey::new([0x42; 32]);
-        let blob = serialize_capsule(&seal_seed(&key, &a_seed(), &mut SysRng).expect("seal"))
-            .expect("serialize");
+        let blob =
+            serialize_capsule(&seal_seed(&key, &a_seed(), &a_key(), &mut SysRng).expect("seal"))
+                .expect("serialize");
         let parsed = parse_capsule(&blob).expect("parse");
         assert_eq!(
             hash(&blob),
@@ -285,6 +314,10 @@ mod tests {
 
     fn a_seed() -> Secret<[u8; SEED_LEN]> {
         Secret::new([7u8; SEED_LEN])
+    }
+
+    fn a_key() -> Secret<[u8; ACCESS_CODE_KEY_LEN]> {
+        Secret::new([0x33; ACCESS_CODE_KEY_LEN])
     }
 
     /// A fixed test key; capsule tests are sealed-envelope round-trips and
@@ -298,9 +331,25 @@ mod tests {
     fn seal_unseal_roundtrip() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         let out = unseal_seed(&key, &capsule).expect("unseal");
-        assert_eq!(out.expose_secret(), seed.expose_secret());
+        assert_eq!(out.seed.expose_secret(), seed.expose_secret());
+        assert_eq!(out.access_code_key.expose_secret(), a_key().expose_secret());
+    }
+
+    /// A pre-access-code capsule (32-byte seed payload) fails the length
+    /// check before any decryption: the payload size is the format version.
+    #[test]
+    fn a_legacy_seed_only_capsule_is_rejected() {
+        let legacy_len = MAGIC.len() + 32 + 1 + NONCE_LEN + 1 + (32 + TAG_LEN);
+        let blob = vec![0u8; legacy_len];
+        assert!(matches!(
+            parse_capsule(&blob),
+            Err(CapsuleError::BadLength {
+                actual: 114,
+                expected: CAPSULE_LEN
+            })
+        ));
     }
 
     /// A capsule whose magic no longer says `ZNS_SEED` never even reaches
@@ -309,7 +358,7 @@ mod tests {
     fn bad_magic_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         capsule.magic[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -322,7 +371,7 @@ mod tests {
     fn flipped_ciphertext_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         capsule.ciphertext[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -336,7 +385,7 @@ mod tests {
     fn tampered_fingerprint_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         capsule.fingerprint[0] ^= 0xFF;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -350,7 +399,7 @@ mod tests {
     fn bad_nonce_length_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         capsule.nonce.truncate(NONCE_LEN - 1);
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -363,12 +412,13 @@ mod tests {
     fn on_disk_serialisation_roundtrip() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         let bytes = serialize_capsule(&capsule).expect("serialize");
         let parsed = parse_capsule(&bytes).expect("parse");
         assert_eq!(parsed, capsule);
         let out = unseal_seed(&key, &parsed).expect("unseal");
-        assert_eq!(out.expose_secret(), seed.expose_secret());
+        assert_eq!(out.seed.expose_secret(), seed.expose_secret());
+        assert_eq!(out.access_code_key.expose_secret(), a_key().expose_secret());
     }
 
     /// AEAD integrity: any nonce bit-flip fails the Poly1305 tag.
@@ -376,7 +426,7 @@ mod tests {
     fn flipped_nonce_rejected() {
         let key = fake_key();
         let seed = a_seed();
-        let mut capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let mut capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         capsule.nonce[0] ^= 0x01;
         assert!(matches!(
             unseal_seed(&key, &capsule),
@@ -390,7 +440,7 @@ mod tests {
     fn postcard_layout_matches_documented_fields() {
         let key = fake_key();
         let seed = a_seed();
-        let capsule = seal_seed(&key, &seed, &mut SysRng).expect("seal");
+        let capsule = seal_seed(&key, &seed, &a_key(), &mut SysRng).expect("seal");
         let bytes = serialize_capsule(&capsule).expect("serialize");
         assert_eq!(&bytes[0..8], b"ZNS_SEED");
         assert_eq!(&bytes[8..40], &capsule.fingerprint);
@@ -410,11 +460,13 @@ mod tests {
         let mut aad = Vec::with_capacity(MAGIC.len() + other.len());
         aad.extend_from_slice(&MAGIC);
         aad.extend_from_slice(&other);
+        let mut payload = [0u8; PAYLOAD_LEN];
+        payload[..SEED_LEN].copy_from_slice(seed.expose_secret());
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: seed.expose_secret(),
+                    msg: &payload,
                     aad: &aad,
                 },
             )

@@ -11,6 +11,10 @@ use crate::sealing::dev_sealing_key;
 /// 32 zero bytes. Every dev key derives from it.
 pub const DEV_SEED: [u8; 32] = [0u8; 32];
 
+/// The dev access-code key, sealed into the dev capsule beside the seed.
+/// Fixed, like the dev seed: tests compute dev claim codes from it.
+pub const DEV_ACCESS_CODE_KEY: [u8; 32] = [0u8; 32];
+
 /// The seed's ZIP-32 fingerprint.
 pub fn dev_seed_fingerprint() -> SeedFingerprint {
     SeedFingerprint::from_seed(&DEV_SEED).expect("32 bytes is a valid seed")
@@ -28,8 +32,13 @@ pub fn write_dev_keys(
     std::fs::create_dir_all(dir)?;
 
     let key = dev_sealing_key(CAPSULE_KEY_CONTEXT);
-    let sealed = capsule::seal_seed(&key, &Secret::new(DEV_SEED), &mut rand::rngs::SysRng)
-        .map_err(std::io::Error::other)?;
+    let sealed = capsule::seal_seed(
+        &key,
+        &Secret::new(DEV_SEED),
+        &Secret::new(DEV_ACCESS_CODE_KEY),
+        &mut rand::rngs::SysRng,
+    )
+    .map_err(std::io::Error::other)?;
     let blob = capsule::serialize_capsule(&sealed).expect("a fresh capsule serializes");
     std::fs::write(dir.join("zns_seed.capsule"), blob)?;
 
@@ -60,9 +69,10 @@ mod tests {
         let blob = std::fs::read(dir.join("zns_seed.capsule")).expect("capsule file");
         let capsule = capsule::parse_capsule(&blob).expect("capsule parses");
         assert_eq!(capsule.fingerprint, dev_seed_fingerprint().to_bytes());
-        let seed = capsule::unseal_seed(&dev_sealing_key(CAPSULE_KEY_CONTEXT), &capsule)
+        let opened = capsule::unseal_seed(&dev_sealing_key(CAPSULE_KEY_CONTEXT), &capsule)
             .expect("dev capsule unseals");
-        assert_eq!(seed.expose_secret(), &DEV_SEED);
+        assert_eq!(opened.seed.expose_secret(), &DEV_SEED);
+        assert_eq!(opened.access_code_key.expose_secret(), &DEV_ACCESS_CODE_KEY);
 
         // Display form on both sides, so a hex-encoded fingerprint fails here.
         let manifest =

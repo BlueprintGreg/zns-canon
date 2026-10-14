@@ -17,11 +17,11 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::attestation::REPORT_DATA_LEN;
-use crate::capsule::SEED_LEN;
+use crate::capsule::{SeedAndAccessCodeKey, ACCESS_CODE_KEY_LEN, PAYLOAD_LEN, SEED_LEN};
 
 const AEAD_NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
-const TRANSFER_CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
+const TRANSFER_CIPHERTEXT_LEN: usize = PAYLOAD_LEN + TAG_LEN;
 
 /// Domain separation for [`migration_report_data`].
 pub const MIGRATION_DOMAIN: &[u8] = b"ZNS_MIGRATION_V1";
@@ -110,12 +110,13 @@ where
     })
 }
 
-/// Encrypt the seed to M2's ephemeral public key.
+/// Encrypt the capsule payload — the seed and the access-code key — to
+/// M2's ephemeral public key.
 ///
 /// The offer nonce and manifest hash are mixed into the wrap key and the
 /// AEAD associated data, so this ciphertext opens only for this offer.
 pub fn encrypt_seed<R>(
-    seed: &Secret<[u8; SEED_LEN]>,
+    payload: &SeedAndAccessCodeKey,
     offer: &MigrationOffer,
     rng: &mut R,
 ) -> Result<EncryptedSeedTransfer, MigrationError>
@@ -167,13 +168,17 @@ where
         );
         shared_bytes.zeroize();
         let cipher = XChaCha20Poly1305::new_from_slice(&key).expect("wrap key is 32 bytes");
+        let mut payload_bytes = [0u8; PAYLOAD_LEN];
+        payload_bytes[..SEED_LEN].copy_from_slice(payload.seed.expose_secret());
+        payload_bytes[SEED_LEN..].copy_from_slice(payload.access_code_key.expose_secret());
         let result = cipher.encrypt(
             XNonce::from_slice(&aead_nonce),
             Payload {
-                msg: seed.expose_secret(),
+                msg: &payload_bytes,
                 aad: &aad,
             },
         );
+        payload_bytes.zeroize();
         key.zeroize();
         result.map_err(|_| MigrationError::Seal)?
     };
@@ -197,7 +202,7 @@ pub fn decrypt_seed(
     ephemeral_secret: &Secret<[u8; 32]>,
     offer: &MigrationOffer,
     transfer: &EncryptedSeedTransfer,
-) -> Result<Secret<[u8; SEED_LEN]>, MigrationError> {
+) -> Result<SeedAndAccessCodeKey, MigrationError> {
     if offer.ephemeral_pubkey == [0u8; 32] || transfer.sender_ephemeral_pubkey == [0u8; 32] {
         return Err(MigrationError::ZeroPublicKey);
     }
@@ -242,16 +247,22 @@ pub fn decrypt_seed(
         key.zeroize();
         result.map_err(|_| MigrationError::Decrypt)?
     };
-    if plaintext.len() != SEED_LEN {
+    if plaintext.len() != PAYLOAD_LEN {
         plaintext.zeroize();
         return Err(MigrationError::Decrypt);
     }
     let mut seed = [0u8; SEED_LEN];
-    seed.copy_from_slice(&plaintext);
+    seed.copy_from_slice(&plaintext[..SEED_LEN]);
+    let mut access_code_key = [0u8; ACCESS_CODE_KEY_LEN];
+    access_code_key.copy_from_slice(&plaintext[SEED_LEN..]);
     plaintext.zeroize();
-    let secret = Secret::new(seed);
+    let opened = SeedAndAccessCodeKey {
+        seed: Secret::new(seed),
+        access_code_key: Secret::new(access_code_key),
+    };
     seed.zeroize();
-    Ok(secret)
+    access_code_key.zeroize();
+    Ok(opened)
 }
 
 fn wrap_key(
@@ -309,6 +320,17 @@ mod tests {
         StdRng::seed_from_u64(11)
     }
 
+    fn a_key() -> Secret<[u8; ACCESS_CODE_KEY_LEN]> {
+        Secret::new([0x33; ACCESS_CODE_KEY_LEN])
+    }
+
+    fn payload() -> SeedAndAccessCodeKey {
+        SeedAndAccessCodeKey {
+            seed: seed(),
+            access_code_key: a_key(),
+        }
+    }
+
     fn seed() -> Secret<[u8; SEED_LEN]> {
         let mut bytes = [0u8; SEED_LEN];
         for (i, byte) in bytes.iter_mut().enumerate() {
@@ -347,7 +369,7 @@ mod tests {
             nonce: [0x44; 32],
             manifest_hash: [0x66; 32],
         };
-        let transfer = encrypt_seed(&seed(), &offer, &mut rng).unwrap();
+        let transfer = encrypt_seed(&payload(), &offer, &mut rng).unwrap();
         let mut encoded = [0u8; TRANSFER_LEN];
         encoded[..32].copy_from_slice(&transfer.sender_ephemeral_pubkey);
         encoded[32..32 + AEAD_NONCE_LEN].copy_from_slice(&transfer.nonce);
@@ -360,7 +382,11 @@ mod tests {
         );
 
         let opened = decrypt_seed(&keypair.secret, &offer, &transfer).unwrap();
-        assert_eq!(opened.expose_secret(), seed().expose_secret());
+        assert_eq!(opened.seed.expose_secret(), seed().expose_secret());
+        assert_eq!(
+            opened.access_code_key.expose_secret(),
+            a_key().expose_secret()
+        );
 
         let mut other_nonce = offer;
         other_nonce.nonce[0] ^= 1;
@@ -397,7 +423,7 @@ mod tests {
             nonce: [1u8; 32],
             manifest_hash: [2u8; 32],
         };
-        let error = encrypt_seed(&seed(), &offer, &mut rng).unwrap_err();
+        let error = encrypt_seed(&payload(), &offer, &mut rng).unwrap_err();
         assert_eq!(error, MigrationError::ZeroPublicKey);
     }
 
@@ -412,7 +438,7 @@ mod tests {
             nonce: [1u8; 32],
             manifest_hash: [2u8; 32],
         };
-        let error = encrypt_seed(&seed(), &offer, &mut rng).unwrap_err();
+        let error = encrypt_seed(&payload(), &offer, &mut rng).unwrap_err();
         assert_eq!(error, MigrationError::NonContributory);
     }
 }
