@@ -16,10 +16,14 @@ pub fn dev_seed_fingerprint() -> SeedFingerprint {
     SeedFingerprint::from_seed(&DEV_SEED).expect("32 bytes is a valid seed")
 }
 
-/// Writes the dev `keys/` dir: `zns_seed.capsule` + `zns_mint.conf`.
-/// `birthday` is the height the ceremony anchor was mined at — pass the
-/// ceremony tip, boot cross-checks it.
-pub fn write_dev_keys(dir: impl AsRef<Path>, birthday: u32) -> std::io::Result<()> {
+/// Writes the dev `keys/` dir: `zns_seed.capsule` +
+/// `zns_custody_manifest.toml`. `birthday` is the height the ceremony
+/// anchor `anchor_txid` was mined at — boot verifies both against the chain.
+pub fn write_dev_keys(
+    dir: impl AsRef<Path>,
+    birthday: u32,
+    anchor_txid: &str,
+) -> std::io::Result<()> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
 
@@ -29,15 +33,16 @@ pub fn write_dev_keys(dir: impl AsRef<Path>, birthday: u32) -> std::io::Result<(
     let blob = capsule::serialize_capsule(&sealed).expect("a fresh capsule serializes");
     std::fs::write(dir.join("zns_seed.capsule"), blob)?;
 
-    // Three fixed lines, formatted by hand; boot parses them with `toml`.
-    // Display form, not hex: boot's `FromStr` is bech32.
-    let conf = format!(
+    // The manifest fields boot reads, formatted by hand; boot parses them
+    // with `toml`. Display form, not hex: boot's `FromStr` is bech32.
+    let manifest = format!(
         "network = \"regtest\"\n\
-         expected_seed_fingerprint = \"{}\"\n\
+         seed_fingerprint = \"{}\"\n\
+         anchor_txid = \"{anchor_txid}\"\n\
          birthday = {birthday}\n",
         dev_seed_fingerprint(),
     );
-    std::fs::write(dir.join("zns_mint.conf"), conf)
+    std::fs::write(dir.join("zns_custody_manifest.toml"), manifest)
 }
 
 #[cfg(test)]
@@ -49,7 +54,8 @@ mod tests {
     fn writes_what_boot_reads() {
         let dir = std::env::temp_dir().join(format!("zns-canon-regtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        write_dev_keys(&dir, 100).expect("write dev keys");
+        let txid = "ab".repeat(32);
+        write_dev_keys(&dir, 100, &txid).expect("write dev keys");
 
         let blob = std::fs::read(dir.join("zns_seed.capsule")).expect("capsule file");
         let capsule = capsule::parse_capsule(&blob).expect("capsule parses");
@@ -59,12 +65,14 @@ mod tests {
         assert_eq!(seed.expose_secret(), &DEV_SEED);
 
         // Display form on both sides, so a hex-encoded fingerprint fails here.
-        let conf = std::fs::read_to_string(dir.join("zns_mint.conf")).expect("conf file");
+        let manifest =
+            std::fs::read_to_string(dir.join("zns_custody_manifest.toml")).expect("manifest file");
         let expected = format!(
-            "network = \"regtest\"\nexpected_seed_fingerprint = \"{}\"\nbirthday = 100\n",
+            "network = \"regtest\"\nseed_fingerprint = \"{}\"\nanchor_txid = \"{txid}\"\nbirthday = 100\n",
             dev_seed_fingerprint()
         );
-        assert_eq!(conf, expected);
+        assert_eq!(manifest, expected);
+        assert!(!dir.join("zns_mint.conf").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
