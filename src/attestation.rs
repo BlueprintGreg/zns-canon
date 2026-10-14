@@ -61,8 +61,35 @@ pub enum AttestationError {
     #[error("attestation measurement is all zeros")]
     ZeroMeasurement,
 
+    #[error("attestation guest policy is {0:#x}")]
+    LaunchPolicy(u64),
+
+    #[error("attestation reported SNP TCB {snp:#x} is below the {product} minimum {minimum:#x}")]
+    LowTcb {
+        product: String,
+        snp: u8,
+        minimum: u8,
+    },
+
     #[error("SEV-SNP attestation verification requires a Linux SNP guest")]
     Unavailable,
+}
+
+/// This guest launches at `0x30000`: SMT is allowed, and debug and a migration
+/// agent are not. The host cannot read guest memory. A capsule sealed under
+/// this policy does not open under another one.
+pub const LAUNCH_POLICY: u64 = 0x30000;
+
+/// Minimum `reported_tcb.snp` from AMD-SB-3034 ("TCB Value for SEV Attestation").
+/// Siena uses the Genoa value. The bulletin does not publish a floor for the
+/// other TCB components.
+fn min_reported_snp(product: &str) -> Result<u8, String> {
+    match product {
+        "Milan" => Ok(0x1D),
+        "Genoa" => Ok(0x1C),
+        "Turin" => Ok(0x05),
+        other => Err(format!("no SNP TCB floor for {other}")),
+    }
 }
 
 /// Parsed attestation report with the fields zns-keygen needs.
@@ -131,8 +158,9 @@ pub fn request(capsule_bytes: &[u8], expected_fingerprint: &SeedFingerprint) -> 
     ))
 }
 
-/// Ask the PSP for a report and verify it end-to-end: VCEK signature, pinned
-/// ARK chain, requested `report_data`, non-zero measurement.
+/// Ask the PSP for a report and verify it end-to-end: launch policy, reported
+/// SNP TCB, VCEK signature, pinned ARK chain, requested `report_data`,
+/// non-zero measurement.
 fn request_report_data(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attestation {
     #[cfg(not(target_os = "linux"))]
     {
@@ -149,6 +177,7 @@ fn request_report_data(requested_report_data: &[u8; REPORT_DATA_LEN]) -> Attesta
             .expect("FATAL: request SEV-SNP attestation report");
         let report = AttestationReport::from_bytes(&report_bytes)
             .expect("FATAL: parse SEV-SNP attestation report");
+        require_launch(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
         let (ask, vcek) =
             fetch_endorsement(&report).unwrap_or_else(|error| panic!("FATAL: {error}"));
         verify_vcek_report(&report, &ask, &vcek)
@@ -192,6 +221,7 @@ pub fn stored(
     {
         let report = AttestationReport::from_bytes(&report_bytes)
             .map_err(|error| AttestationError::Parse(error.to_string()))?;
+        require_launch(&report)?;
         let (ask, vcek) = fetch_endorsement(&report).map_err(AttestationError::Endorsement)?;
         verify_vcek_report(&report, &ask, &vcek).map_err(AttestationError::Signature)?;
         let attestation = attestation_from_report(report_bytes, &report, *expected_report_data);
@@ -241,6 +271,27 @@ pub fn verify_vcek_report(
     (&chain, report)
         .verify()
         .map_err(|e| format!("VCEK signature verification failed: {e}"))?;
+    Ok(())
+}
+
+/// Refuse a debug launch and firmware below the pinned SNP TCB.
+///
+/// Called from [`request`] and [`stored`] after the report parses and before
+/// AMD is contacted. Signature verification follows when these admission checks succeed.
+pub fn require_launch(report: &AttestationReport) -> Result<(), AttestationError> {
+    let policy = u64::from(report.policy);
+    if policy != LAUNCH_POLICY {
+        return Err(AttestationError::LaunchPolicy(policy));
+    }
+    let product = kds_product(report).map_err(AttestationError::Endorsement)?;
+    let minimum = min_reported_snp(product).map_err(AttestationError::Endorsement)?;
+    if report.reported_tcb.snp < minimum {
+        return Err(AttestationError::LowTcb {
+            product: product.to_string(),
+            snp: report.reported_tcb.snp,
+            minimum,
+        });
+    }
     Ok(())
 }
 
@@ -654,6 +705,58 @@ mod tests {
             attestation.verify_report_data().unwrap_err(),
             AttestationError::ZeroMeasurement
         );
+    }
+
+    fn report_at(policy: u64, family: u8, model: u8, snp: u8) -> AttestationReport {
+        use sev::firmware::guest::GuestPolicy;
+        let mut report = milan_report();
+        report.policy = GuestPolicy::from(policy);
+        report.cpuid_fam_id = Some(family);
+        report.cpuid_mod_id = Some(model);
+        report.reported_tcb.snp = snp;
+        report
+    }
+
+    #[test]
+    fn a_debug_launch_is_refused() {
+        let debug = LAUNCH_POLICY | (1 << 19);
+        let report = report_at(debug, 0x19, 0xA0, 0x1C);
+        assert_eq!(
+            require_launch(&report).unwrap_err(),
+            AttestationError::LaunchPolicy(debug)
+        );
+    }
+
+    #[test]
+    fn a_migration_agent_launch_is_refused() {
+        let migrate = LAUNCH_POLICY | (1 << 18);
+        let report = report_at(migrate, 0x19, 0xA0, 0x1C);
+        assert_eq!(
+            require_launch(&report).unwrap_err(),
+            AttestationError::LaunchPolicy(migrate)
+        );
+    }
+
+    #[test]
+    fn siena_firmware_below_the_snp_floor_is_refused() {
+        let report = report_at(LAUNCH_POLICY, 0x19, 0xA0, 0x1B);
+        assert_eq!(
+            require_launch(&report).unwrap_err(),
+            AttestationError::LowTcb {
+                product: "Genoa".to_string(),
+                snp: 0x1B,
+                minimum: 0x1C,
+            }
+        );
+    }
+
+    #[test]
+    fn the_pinned_policy_and_snp_floor_are_accepted() {
+        require_launch(&report_at(LAUNCH_POLICY, 0x19, 0xA0, 0x1C)).unwrap();
+        require_launch(&report_at(LAUNCH_POLICY, 0x19, 0x01, 0x1D)).unwrap();
+        require_launch(&report_at(LAUNCH_POLICY, 0x1A, 0x00, 0x05)).unwrap();
+        assert!(require_launch(&report_at(LAUNCH_POLICY, 0x19, 0x01, 0x1C)).is_err());
+        assert!(require_launch(&report_at(LAUNCH_POLICY, 0x1A, 0x00, 0x04)).is_err());
     }
 
     #[test]
