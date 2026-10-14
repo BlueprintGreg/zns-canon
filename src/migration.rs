@@ -140,13 +140,13 @@ where
     let mut payload_bytes = [0u8; PAYLOAD_LEN];
     payload_bytes[..SEED_LEN].copy_from_slice(payload.seed.expose_secret());
     payload_bytes[SEED_LEN..].copy_from_slice(payload.access_code_key.expose_secret());
-    let (sender_public, nonce, ciphertext) = seal_to_offer(&payload_bytes, offer, rng)?;
+    let sealed = seal_to_offer(&payload_bytes, offer, rng)?;
     payload_bytes.zeroize();
     let mut out = [0u8; TRANSFER_CIPHERTEXT_LEN];
-    out.copy_from_slice(&ciphertext);
+    out.copy_from_slice(&sealed.ciphertext);
     Ok(EncryptedSeedTransfer {
-        sender_ephemeral_pubkey: sender_public,
-        nonce,
+        sender_ephemeral_pubkey: sealed.sender_public,
+        nonce: sealed.nonce,
         ciphertext: out,
     })
 }
@@ -161,12 +161,12 @@ pub fn wrap_secret<R>(
 where
     R: TryCryptoRng,
 {
-    let (sender_public, nonce, ciphertext) = seal_to_offer(secret.expose_secret(), offer, rng)?;
+    let sealed = seal_to_offer(secret.expose_secret(), offer, rng)?;
     let mut out = [0u8; WRAPPED_SECRET_CIPHERTEXT_LEN];
-    out.copy_from_slice(&ciphertext);
+    out.copy_from_slice(&sealed.ciphertext);
     Ok(WrappedSecret {
-        sender_ephemeral_pubkey: sender_public,
-        nonce,
+        sender_ephemeral_pubkey: sealed.sender_public,
+        nonce: sealed.nonce,
         ciphertext: out,
     })
 }
@@ -175,11 +175,19 @@ where
 /// into the wrap key and the AEAD associated data, XChaCha20Poly1305 over
 /// the plaintext. Returns the one-time sender public key, the AEAD nonce,
 /// and the ciphertext.
+/// What [`seal_to_offer`] produces: the one-time sender public key, the
+/// AEAD nonce, and the ciphertext.
+struct Sealed {
+    sender_public: [u8; 32],
+    nonce: [u8; AEAD_NONCE_LEN],
+    ciphertext: Vec<u8>,
+}
+
 fn seal_to_offer<R>(
     plaintext: &[u8],
     offer: &MigrationOffer,
     rng: &mut R,
-) -> Result<([u8; 32], [u8; AEAD_NONCE_LEN], Vec<u8>), MigrationError>
+) -> Result<Sealed, MigrationError>
 where
     R: TryCryptoRng,
 {
@@ -238,7 +246,11 @@ where
         key.zeroize();
         result.map_err(|_| MigrationError::Seal)?
     };
-    Ok((sender_public, aead_nonce, ciphertext))
+    Ok(Sealed {
+        sender_public,
+        nonce: aead_nonce,
+        ciphertext,
+    })
 }
 
 /// Decrypt a seed ciphertext with M2's ephemeral secret key.
