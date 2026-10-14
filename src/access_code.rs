@@ -3,7 +3,7 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Mirrors zns-keygen's `SCALAR_DOMAIN`.
 pub const SCALAR_DOMAIN: &[u8] = b"ZNS/access-code/x25519/v1";
@@ -23,9 +23,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn seed_scalar(seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut mac = HmacSha256::new_from_slice(seed).expect("HMAC-SHA256 accepts any key length");
     mac.update(SCALAR_DOMAIN);
-    let out = mac.finalize().into_bytes();
+    let mut out = mac.finalize().into_bytes();
     let mut scalar = Zeroizing::new([0u8; 32]);
     scalar.copy_from_slice(&out);
+    out.zeroize();
     scalar
 }
 
@@ -33,9 +34,10 @@ pub fn seed_scalar(seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 pub fn purpose(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut mac = HmacSha256::new_from_slice(shared).expect("HMAC-SHA256 accepts any key length");
     mac.update(PURPOSE);
-    let out = mac.finalize().into_bytes();
+    let mut out = mac.finalize().into_bytes();
     let mut digest = Zeroizing::new([0u8; 32]);
     digest.copy_from_slice(&out);
+    out.zeroize();
     digest
 }
 
@@ -48,7 +50,7 @@ pub fn purpose_key(seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         shared.was_contributory(),
         "the issuer public key is not a contributory X25519 point"
     );
-    purpose(&shared.to_bytes())
+    purpose(shared.as_bytes())
 }
 
 #[cfg(test)]
