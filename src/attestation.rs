@@ -352,38 +352,39 @@ fn vcek_matches_report(report: &AttestationReport, vcek: &Certificate) -> Result
         }
     }
 
-    let hw_id = extension(OID_HW_ID)
-        .map(hw_id_value)
-        .transpose()?
-        .ok_or("VCEK has no hwID extension")?;
-    // A shorter hwID names the leading bytes of the chip id; the rest of
-    // the reported id must then be zero.
-    let (named, rest) = report
-        .chip_id
-        .split_at_checked(hw_id.len())
-        .ok_or("VCEK hwID is longer than the chip id")?;
-    if named != hw_id || rest.iter().any(|byte| *byte != 0) {
+    let hw_id = extension(OID_HW_ID).ok_or("VCEK has no hwID extension")?;
+    if !hw_id_encodings(hw_id).any(|id| names_chip(id, &report.chip_id)) {
         return Err("VCEK hwID does not match the report chip id".into());
     }
     Ok(())
+}
+
+/// The hwID extension: a DER OCTET STRING, or the raw bytes in older VCEKs.
+///
+/// A raw id can also parse as DER, so a leading `0x04` does not decide the
+/// encoding. Both readings are offered, and the caller keeps the one that
+/// names the report's chip.
+fn hw_id_encodings(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    use x509_cert::der::asn1::OctetStringRef;
+    use x509_cert::der::Decode;
+    let der = OctetStringRef::from_der(bytes)
+        .ok()
+        .map(|octets| octets.as_bytes());
+    der.into_iter().chain(std::iter::once(bytes))
+}
+
+/// A shorter hwID names the leading bytes of the chip id; the rest of the
+/// reported id must then be zero.
+fn names_chip(hw_id: &[u8], chip_id: &[u8; 64]) -> bool {
+    chip_id
+        .split_at_checked(hw_id.len())
+        .is_some_and(|(named, rest)| named == hw_id && rest.iter().all(|byte| *byte == 0))
 }
 
 /// An SPL extension: a DER INTEGER that fits in one byte.
 fn spl_value(bytes: &[u8]) -> Result<u8, String> {
     use x509_cert::der::Decode;
     u8::from_der(bytes).map_err(|error| format!("VCEK SPL extension: {error}"))
-}
-
-/// The hwID extension: a DER OCTET STRING, or the raw bytes in older VCEKs.
-fn hw_id_value(bytes: &[u8]) -> Result<&[u8], String> {
-    use x509_cert::der::asn1::OctetStringRef;
-    use x509_cert::der::Decode;
-    match bytes.first() {
-        Some(0x04) => OctetStringRef::from_der(bytes)
-            .map(|octets| octets.as_bytes())
-            .map_err(|error| format!("VCEK hwID extension: {error}")),
-        _ => Ok(bytes),
-    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -711,6 +712,29 @@ mod tests {
         report.chip_id[0] ^= 0x01;
         let error = verify_vcek_report(&report, &ask, &vcek).unwrap_err();
         assert!(error.contains("hwID"), "{error}");
+    }
+
+    /// A raw hwID can also parse as a DER OCTET STRING. `04 3e` followed by
+    /// 62 bytes is both a raw 64-byte id and a valid 62-byte DER value, so
+    /// the leading `0x04` must not pick the encoding.
+    #[test]
+    fn a_raw_hw_id_that_also_parses_as_der_still_names_its_chip() {
+        let mut chip_id = [0u8; 64];
+        chip_id[0] = 0x04;
+        chip_id[1] = 0x3e;
+        for (i, byte) in chip_id[2..].iter_mut().enumerate() {
+            *byte = i as u8 + 1;
+        }
+        assert!(hw_id_encodings(&chip_id).any(|id| names_chip(id, &chip_id)));
+
+        let mut der = vec![0x04, 0x40];
+        der.extend_from_slice(&chip_id);
+        assert!(hw_id_encodings(&der).any(|id| names_chip(id, &chip_id)));
+
+        let mut other = chip_id;
+        other[63] ^= 0x01;
+        assert!(!hw_id_encodings(&chip_id).any(|id| names_chip(id, &other)));
+        assert!(!hw_id_encodings(&der).any(|id| names_chip(id, &other)));
     }
 
     /// The cache file name is not evidence. A genuine VCEK saved under the
