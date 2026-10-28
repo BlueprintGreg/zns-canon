@@ -26,6 +26,7 @@ sigstore-verify = "0.14"
 thiserror = "1"
 tracing = "0.1"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+x509-cert = { version = "0.2", default-features = false }
 x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 zip32 = "0.3"

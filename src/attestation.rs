@@ -12,7 +12,8 @@
 //!      for a normal SNP report. That report is the VCEK-signed evidence.
 //!   3. Fetch the public VCEK and ASK from AMD's Key Distribution Service.
 //!      The ARK in that response is not the trust anchor.
-//!   4. `verify_vcek_report()` — require the ASK to chain to a pinned AMD
+//!   4. `verify_vcek_report()` — require the VCEK to name the report chip
+//!      and reported TCB, the ASK to chain to a pinned AMD
 //!      ARK, and the VCEK signature to cover the report.
 //!      `Attestation::verify_report_data()` then checks `report_data` and
 //!      that the measurement is not zero. Both run before the attestation
@@ -267,6 +268,7 @@ pub fn verify_vcek_report(
     vcek: &Certificate,
 ) -> Result<(), String> {
     vcek_signing_key(report)?;
+    vcek_matches_report(report, vcek)?;
     let chain = chain_under_pinned_ark(ask.clone(), vcek.clone())?;
     (&chain, report)
         .verify()
@@ -306,6 +308,82 @@ fn vcek_signing_key(report: &AttestationReport) -> Result<(), String> {
         return Err("attestation report chip id is zero".into());
     }
     Ok(())
+}
+
+/// AMD VCEK certificate extensions (VCEK certificate specification, chapter 3).
+const OID_BL_SPL: &str = "1.3.6.1.4.1.3704.1.3.1";
+const OID_TEE_SPL: &str = "1.3.6.1.4.1.3704.1.3.2";
+const OID_SNP_SPL: &str = "1.3.6.1.4.1.3704.1.3.3";
+const OID_UCODE_SPL: &str = "1.3.6.1.4.1.3704.1.3.8";
+const OID_FMC_SPL: &str = "1.3.6.1.4.1.3704.1.3.9";
+const OID_HW_ID: &str = "1.3.6.1.4.1.3704.1.4";
+
+/// Require the VCEK to be the one AMD issued for this report's chip and
+/// reported TCB.
+///
+/// The signature check alone does not show this: any genuine VCEK verifies
+/// a report its own key signed. A VCEK can come from the `/state/kds` cache,
+/// which the host can write, so a cached certificate for an older TCB would
+/// otherwise stand in for the TCB the report claims.
+fn vcek_matches_report(report: &AttestationReport, vcek: &Certificate) -> Result<(), String> {
+    let cert = x509_cert::Certificate::from(vcek.clone());
+    let extensions = cert.tbs_certificate.extensions.unwrap_or_default();
+    let extension = |oid: &str| {
+        extensions
+            .iter()
+            .find(|ext| ext.extn_id.to_string() == oid)
+            .map(|ext| ext.extn_value.as_bytes())
+    };
+
+    let tcb = &report.reported_tcb;
+    let spls = [
+        ("blSPL", OID_BL_SPL, Some(tcb.bootloader)),
+        ("teeSPL", OID_TEE_SPL, Some(tcb.tee)),
+        ("snpSPL", OID_SNP_SPL, Some(tcb.snp)),
+        ("ucodeSPL", OID_UCODE_SPL, Some(tcb.microcode)),
+        ("fmcSPL", OID_FMC_SPL, tcb.fmc),
+    ];
+    for (name, oid, reported) in spls {
+        let certified = extension(oid).map(spl_value).transpose()?;
+        if certified != reported {
+            return Err(format!(
+                "VCEK {name} {certified:?} does not match the reported TCB {reported:?}"
+            ));
+        }
+    }
+
+    let hw_id = extension(OID_HW_ID)
+        .map(hw_id_value)
+        .transpose()?
+        .ok_or("VCEK has no hwID extension")?;
+    // A shorter hwID names the leading bytes of the chip id; the rest of
+    // the reported id must then be zero.
+    let (named, rest) = report
+        .chip_id
+        .split_at_checked(hw_id.len())
+        .ok_or("VCEK hwID is longer than the chip id")?;
+    if named != hw_id || rest.iter().any(|byte| *byte != 0) {
+        return Err("VCEK hwID does not match the report chip id".into());
+    }
+    Ok(())
+}
+
+/// An SPL extension: a DER INTEGER that fits in one byte.
+fn spl_value(bytes: &[u8]) -> Result<u8, String> {
+    use x509_cert::der::Decode;
+    u8::from_der(bytes).map_err(|error| format!("VCEK SPL extension: {error}"))
+}
+
+/// The hwID extension: a DER OCTET STRING, or the raw bytes in older VCEKs.
+fn hw_id_value(bytes: &[u8]) -> Result<&[u8], String> {
+    use x509_cert::der::asn1::OctetStringRef;
+    use x509_cert::der::Decode;
+    match bytes.first() {
+        Some(0x04) => OctetStringRef::from_der(bytes)
+            .map(|octets| octets.as_bytes())
+            .map_err(|error| format!("VCEK hwID extension: {error}")),
+        _ => Ok(bytes),
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -595,6 +673,62 @@ mod tests {
     fn milan_vcek_report_verifies() {
         let (ask, vcek) = milan_ask_and_vcek();
         verify_vcek_report(&milan_report(), &ask, &vcek).unwrap();
+    }
+
+    #[test]
+    fn the_milan_vcek_names_its_reports_chip_and_tcb() {
+        let (_, vcek) = milan_ask_and_vcek();
+        vcek_matches_report(&milan_report(), &vcek).unwrap();
+    }
+
+    #[test]
+    fn a_vcek_for_another_tcb_is_rejected() {
+        let (ask, vcek) = milan_ask_and_vcek();
+        type Mutation = (&'static str, fn(&mut TcbVersion));
+        let mutations: [Mutation; 5] = [
+            ("blSPL", |tcb| {
+                tcb.bootloader = tcb.bootloader.wrapping_add(1)
+            }),
+            ("teeSPL", |tcb| tcb.tee = tcb.tee.wrapping_add(1)),
+            ("snpSPL", |tcb| tcb.snp = tcb.snp.wrapping_add(1)),
+            ("ucodeSPL", |tcb| {
+                tcb.microcode = tcb.microcode.wrapping_add(1)
+            }),
+            ("fmcSPL", |tcb| tcb.fmc = Some(1)),
+        ];
+        for (name, mutate) in mutations {
+            let mut report = milan_report();
+            mutate(&mut report.reported_tcb);
+            let error = verify_vcek_report(&report, &ask, &vcek).unwrap_err();
+            assert!(error.contains(name), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_vcek_for_another_chip_is_rejected() {
+        let (ask, vcek) = milan_ask_and_vcek();
+        let mut report = milan_report();
+        report.chip_id[0] ^= 0x01;
+        let error = verify_vcek_report(&report, &ask, &vcek).unwrap_err();
+        assert!(error.contains("hwID"), "{error}");
+    }
+
+    /// The cache file name is not evidence. A genuine VCEK saved under the
+    /// name of another TCB is refused, from the cache and from KDS alike.
+    #[test]
+    fn a_cached_vcek_saved_under_another_tcb_is_refused() {
+        let dir = temp_kds_dir("planted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut claimed = milan_report_for_kds();
+        claimed.reported_tcb.snp = claimed.reported_tcb.snp.wrapping_add(1);
+        let vcek_path = vcek_cache_path(&dir, "Milan", &claimed.chip_id, &claimed.reported_tcb);
+        std::fs::write(&vcek_path, MILAN_VCEK_DER).unwrap();
+        std::fs::write(chain_cache_path(&dir, "Milan"), milan_kds_chain()).unwrap();
+
+        let probe = KdsProbe::new();
+        let error = fetch_endorsement_cached(&claimed, &dir, |url| probe.get(url)).unwrap_err();
+        assert!(error.contains("snpSPL"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

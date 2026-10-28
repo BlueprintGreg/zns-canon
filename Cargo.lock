@@ -2908,6 +2908,7 @@ dependencies = [
  "tracing",
  "ureq",
  "x25519-dalek",
+ "x509-cert",
  "zeroize",
  "zip32",
 ]
